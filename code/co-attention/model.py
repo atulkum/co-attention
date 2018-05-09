@@ -3,9 +3,7 @@ from __future__ import unicode_literals, print_function, division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-import numpy as np
 
 use_cuda = torch.cuda.is_available()
 
@@ -88,9 +86,9 @@ class FusionBiLSTM(nn.Module):
 
         return e
 
-class Decoder(nn.Module):
+class DynamicDecoder(nn.Module):
     def __init__(self, hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio):
-        super(Decoder, self).__init__()
+        super(DynamicDecoder, self).__init__()
         self.max_dec_steps = max_dec_steps
         self.decoder = nn.LSTM(4 * hidden_dim, hidden_dim, 1, batch_first=True, bidirectional=False)
         init_lstm_forget_bias(self.decoder)
@@ -113,7 +111,9 @@ class Decoder(nn.Module):
 
         # ??how to initialize s_i_1, e_i_1
         s_i_1 = torch.zeros(b, ).long()
-        e_i_1 = torch.zeros(b, ).long()
+        e_i_1 = torch.sum(d_mask, 1)
+        e_i_1 = e_i_1 - 1
+
         if use_cuda:
             s_i_1 = s_i_1.cuda()
             e_i_1 = e_i_1.cuda()
@@ -238,7 +238,7 @@ class CoattentionModel(nn.Module):
 
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.fusion_bilstm = FusionBiLSTM(hidden_dim, dropout_ratio)
-        self.decoder = Decoder(hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio)
+        self.decoder = DynamicDecoder(hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio)
 
     def forward(self, q_seq, q_mask, d_seq, d_mask, span=None):
         Q = self.encoder(q_seq, q_mask) # b x n + 1 x l

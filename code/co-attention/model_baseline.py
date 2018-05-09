@@ -3,9 +3,7 @@ from __future__ import unicode_literals, print_function, division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-import numpy as np
 
 use_cuda = torch.cuda.is_available()
 
@@ -15,7 +13,6 @@ def get_pretrained_embedding(np_embd):
     embedding.weight = nn.Parameter(torch.from_numpy(np_embd).float())
     embedding.weight.requires_grad = False
     return embedding
-
 
 class Encoder(nn.Module):
     def __init__(self, hidden_dim, emb_matrix, dropout_ratio):

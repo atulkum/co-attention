@@ -1,24 +1,22 @@
-import os
-import time
-import json
 import io
+import json
 import logging
+import os
 import sys
+import time
 
 import numpy as np
 import tensorflow as tf
 import torch
+from data_util.data_batcher import get_batch_generator
+from data_util.evaluate import exact_match_score, f1_score
+from data_util.official_eval_helper import get_json_data, generate_answers
+from data_util.pretty_print import print_example
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
-from torch.autograd import Variable
+from data_util.vocab import get_glove
 
 from config import config
-from official_eval_helper import get_json_data, generate_answers
-from vocab import get_glove
-
-from data_batcher import get_batch_generator
-from evaluate import exact_match_score, f1_score
-from pretty_print import print_example
 from model import CoattentionModel
 from model_baseline import Baseline
 
