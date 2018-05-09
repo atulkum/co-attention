@@ -19,7 +19,7 @@ from vocab import get_glove
 from data_batcher import get_batch_generator
 from evaluate import exact_match_score, f1_score
 from pretty_print import print_example
-#from model import CoattentionModel
+from model import CoattentionModel
 from model_baseline import Baseline
 
 logging.basicConfig(level=logging.INFO)
@@ -86,9 +86,11 @@ class Processor(object):
         torch.save(state, model_save_path)
 
     def get_model(self, model_file_path=None, is_eval=False):
-        #model = CoattentionModel(config.hidden_dim, config.maxout_pool_size,
-        #                         self.emb_matrix, config.max_dec_steps, config.dropout_ratio)
-        model = Baseline(config.hidden_dim, self.emb_matrix, config.dropout_ratio)
+        if config.model_type == 'co-attention':
+            model = CoattentionModel(config.hidden_dim, config.maxout_pool_size,
+                                 self.emb_matrix, config.max_dec_steps, config.dropout_ratio)
+        else:
+            model = Baseline(config.hidden_dim, self.emb_matrix, config.dropout_ratio)
 
         if is_eval:
             model = model.eval()

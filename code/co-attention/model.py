@@ -7,23 +7,7 @@ from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
 
-eps = 1e-12
-
 use_cuda = torch.cuda.is_available()
-
-def get_mask_from_seq_len(seq_lens_np, max_len=None):
-    seq_lens = torch.from_numpy(seq_lens_np)
-    if use_cuda:
-        seq_lens = seq_lens.cuda()
-    if max_len is None:
-        max_len = np.max(seq_lens_np)
-    indices = torch.arange(0, max_len, out=torch.LongTensor(max_len)).unsqueeze(0)
-    if use_cuda:
-        indices = indices.cuda()
-    mask = Variable((indices < seq_lens.unsqueeze(1)).float())
-    if use_cuda:
-        mask = mask.cuda()
-    return mask
 
 #out-of-vocabulary words to zero
 def get_pretrained_embedding(np_embd):
@@ -43,6 +27,146 @@ def init_lstm_forget_bias(lstm):
                 bias.data.fill_(0.)
                 bias.data[start:end].fill_(1.)
 
+class Encoder(nn.Module):
+    def __init__(self, hidden_dim, emb_matrix, dropout_ratio):
+        super(Encoder, self).__init__()
+        self.hidden_dim = hidden_dim
+
+        self.embedding = get_pretrained_embedding(emb_matrix)
+        self.emb_dim = self.embedding.embedding_dim
+
+        self.encoder = nn.LSTM(self.emb_dim, hidden_dim, 1, batch_first=True,
+                              bidirectional=False, dropout=dropout_ratio)
+        init_lstm_forget_bias(self.encoder)
+        self.dropout_emb = nn.Dropout(p=dropout_ratio)
+        self.sentinel = nn.Parameter(torch.rand(hidden_dim,))
+
+    def forward(self, seq, mask):
+        lens = torch.sum(mask, 1)
+        lens_sorted, lens_argsort = torch.sort(lens, 0, True)
+        _, lens_argsort_argsort = torch.sort(lens_argsort, 0)
+        seq_ = torch.index_select(seq, 0, lens_argsort)
+
+        seq_embd = self.embedding(seq_)
+        packed = pack_padded_sequence(seq_embd, lens_sorted, batch_first=True)
+        output, _ = self.encoder(packed)
+        e, _ = pad_packed_sequence(output, batch_first=True)
+        e = e.contiguous()
+        e = torch.index_select(e, 0, lens_argsort_argsort)  # B x m x 2l
+        e = self.dropout_emb(e)
+
+        b, _ = list(mask.size())
+        # copy sentinel vector at the end
+        sentinel_exp = self.sentinel.unsqueeze(0).expand(b, self.hidden_dim).unsqueeze(1).contiguous()  # B x 1 x l
+        lens = lens.unsqueeze(1).expand(b, self.hidden_dim).unsqueeze(1)
+
+        sentinel_zero = torch.zeros(b, 1, self.hidden_dim)
+        if use_cuda:
+            sentinel_zero = sentinel_zero.cuda()
+        e = torch.cat([e, sentinel_zero], 1)  # B x m + 1 x l
+        e = e.scatter_(1, lens, sentinel_exp)
+
+        return e
+
+class FusionBiLSTM(nn.Module):
+    def __init__(self, hidden_dim, dropout_ratio):
+        super(FusionBiLSTM, self).__init__()
+        self.fusion_bilstm = nn.LSTM(3 * hidden_dim, hidden_dim, 1, batch_first=True,
+                                     bidirectional=True, dropout=dropout_ratio)
+        init_lstm_forget_bias(self.fusion_bilstm)
+
+    def forward(self, seq, mask):
+        lens = torch.sum(mask, 1)
+        lens_sorted, lens_argsort = torch.sort(lens, 0, True)
+        _, lens_argsort_argsort = torch.sort(lens_argsort, 0)
+        seq_ = torch.index_select(seq, 0, lens_argsort)
+        packed = pack_padded_sequence(seq_, lens_sorted, batch_first=True)
+        output, _ = self.fusion_bilstm(packed)
+        e, _ = pad_packed_sequence(output, batch_first=True)
+        e = e.contiguous()
+        e = torch.index_select(e, 0, lens_argsort_argsort)  # B x m x 2l
+
+        return e
+
+class Decoder(nn.Module):
+    def __init__(self, hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio):
+        super(Decoder, self).__init__()
+        self.max_dec_steps = max_dec_steps
+        self.decoder = nn.LSTM(4 * hidden_dim, hidden_dim, 1, batch_first=True, bidirectional=False)
+        init_lstm_forget_bias(self.decoder)
+
+        self.maxout_start = MaxOutHighway(hidden_dim, maxout_pool_size, dropout_ratio)
+        self.maxout_end = MaxOutHighway(hidden_dim, maxout_pool_size, dropout_ratio)
+
+    def forward(self, U, d_mask, span):
+        b, m, _ = list(U.size())
+
+        curr_mask_s,  curr_mask_e = None, None
+        results_mask_s, results_s = [], []
+        results_mask_e, results_e = [], []
+        step_losses = []
+
+        # decoder
+        mask_mult = (1.0 - d_mask.float()) * (-1e30)
+
+        indices = torch.arange(0, b, out=torch.LongTensor(b))
+
+        # ??how to initialize s_i_1, e_i_1
+        s_i_1 = torch.zeros(b, ).long()
+        e_i_1 = torch.zeros(b, ).long()
+        if use_cuda:
+            s_i_1 = s_i_1.cuda()
+            e_i_1 = e_i_1.cuda()
+            indices = indices.cuda()
+
+        dec_state_i = None
+
+        for _ in range(self.max_dec_steps):
+            u_s_i_1 = U[indices, s_i_1, :]  # b x 2l
+            u_e_i_1 = U[indices, e_i_1, :]  # b x 2l
+            u_cat = torch.cat((u_s_i_1, u_e_i_1), 1)  # b x 4l
+
+            lstm_out, dec_state_i = self.decoder(u_cat.unsqueeze(1), dec_state_i)
+            h_i, c_i = dec_state_i
+            s_target = None
+            e_target = None
+
+            if span is not None:
+                s_target = span[:, 0]
+                e_target = span[:, 1]
+
+            s_i_1, curr_mask_s, step_loss_s = self.maxout_start(h_i, U, curr_mask_s, s_i_1,
+                                                                u_cat, mask_mult, s_target)
+            e_i_1, curr_mask_e, step_loss_e = self.maxout_end(h_i, U, curr_mask_e, e_i_1,
+                                                              u_cat, mask_mult, e_target)
+
+            if span is not None:
+                step_loss = step_loss_s + step_loss_e
+                step_losses.append(step_loss)
+
+            results_mask_s.append(curr_mask_s)
+            results_s.append(s_i_1)
+            results_mask_e.append(curr_mask_e)
+            results_e.append(e_i_1)
+
+        result_pos_s = torch.sum(torch.stack(results_mask_s, 1), 1).long()
+        result_pos_s = result_pos_s - 1
+        idx_s = torch.gather(torch.stack(results_s, 1), 1, result_pos_s.unsqueeze(1)).squeeze()
+
+        result_pos_e = torch.sum(torch.stack(results_mask_e, 1), 1).long()
+        result_pos_e = result_pos_e - 1
+        idx_e = torch.gather(torch.stack(results_e, 1), 1, result_pos_e.unsqueeze(1)).squeeze()
+
+        loss = None
+
+        if span is not None:
+            sum_losses = torch.sum(torch.stack(step_losses, 1), 1)
+            batch_avg_loss = sum_losses / self.max_dec_steps
+            loss = torch.mean(batch_avg_loss)
+
+        return loss, idx_s, idx_e
+
+
 class MaxOutHighway(nn.Module):
     def __init__(self, hidden_dim, maxout_pool_size, dropout_ratio):
         super(MaxOutHighway, self).__init__()
@@ -60,7 +184,9 @@ class MaxOutHighway(nn.Module):
 
         self.m_t_12_mxp = nn.Linear(2 * hidden_dim, maxout_pool_size)
 
-    def forward(self, h_i, U, d_lens, curr_mask, idx_i_1, u_cat, D_mask, mask_mult, target=None):
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, h_i, U, curr_mask, idx_i_1, u_cat, mask_mult, target=None):
         b, m, _ = list(U.size())
 
         r = F.tanh(self.r(torch.cat((h_i.view(-1, self.hidden_dim), u_cat), 1)))  # b x 5l => b x l
@@ -83,118 +209,43 @@ class MaxOutHighway(nn.Module):
         alpha, _ = alpha.max(1)  # b*m
         alpha = alpha.view(-1, m) # b x m
 
-        alpha = alpha * D_mask + mask_mult  # b x m
+        alpha = alpha + mask_mult  # b x m
         alpha = F.log_softmax(alpha, 1)  # b x m
         _, idx_i = torch.max(alpha, dim=1)
-        ''' 
-        d_lens_var = Variable(torch.from_numpy(d_lens))
-        if use_cuda:
-            d_lens_var = d_lens_var.cuda()
 
-        idx_i = torch.min(idx_i, d_lens_var)
-        '''
-
-        # ??both start and end should be same or treat them individually
         if curr_mask is None:
-            curr_mask = (idx_i == idx_i) # all one #(idx_i != idx_i_1)
+            curr_mask = (idx_i == idx_i)
         else:
             idx_i = idx_i*curr_mask.long()
             idx_i_1 = idx_i_1*curr_mask.long()
             curr_mask = (idx_i != idx_i_1)
 
+        step_loss = None
+
         if target is not None:
-            step_loss = -torch.gather(alpha, 1, target.unsqueeze(1)).squeeze()
+            step_loss = self.loss(alpha, target)
             step_loss = step_loss * curr_mask.float()
 
-            return idx_i, curr_mask, step_loss
-        else:
-            return idx_i, curr_mask
+        return idx_i, curr_mask, step_loss
+
 
 class CoattentionModel(nn.Module):
     def __init__(self, hidden_dim, maxout_pool_size, emb_matrix, max_dec_steps, dropout_ratio):
         super(CoattentionModel, self).__init__()
         self.hidden_dim = hidden_dim
-        self.max_dec_steps = max_dec_steps
 
-        self.embedding = get_pretrained_embedding(emb_matrix)
-        self.emb_dim = self.embedding.embedding_dim
-
-        self.dropout_embd = nn.Dropout(p=dropout_ratio)
-
-        self.encoder = nn.LSTM(self.emb_dim, hidden_dim, 1, batch_first=True, bidirectional=False)
-        init_lstm_forget_bias(self.encoder)
-        #?? should sentinel be shared
-        self.d_sentinel = nn.Parameter(torch.rand(hidden_dim,))
-        self.q_sentinel = nn.Parameter(torch.rand(hidden_dim,))
+        self.encoder = Encoder(hidden_dim, emb_matrix, dropout_ratio)
 
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.fusion_bilstm = FusionBiLSTM(hidden_dim, dropout_ratio)
+        self.decoder = Decoder(hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio)
 
-        self.fusion_bilstm = nn.LSTM(3*hidden_dim, hidden_dim, 1, batch_first=True, bidirectional=True)
-        init_lstm_forget_bias(self.fusion_bilstm)
-
-        self.decoder = nn.LSTM(4*hidden_dim, hidden_dim, 1, batch_first=True, bidirectional=False)
-        init_lstm_forget_bias(self.decoder)
-
-        self.maxout_start = MaxOutHighway(hidden_dim, maxout_pool_size, dropout_ratio)
-        self.maxout_end = MaxOutHighway(hidden_dim, maxout_pool_size, dropout_ratio)
-
-    def forward(self, q_seq, q_lens, d_seq, d_lens, span=None):
-        #document processing
-        d_seq_embd = self.embedding(d_seq)
-        #d_seq_embd = self.dropout_embd(d_seq_embd)
-        ctx_packed = pack_padded_sequence(d_seq_embd, d_lens, batch_first=True)
-        ctx_output, _ = self.encoder(ctx_packed)
-        e_ctx, _ = pad_packed_sequence(ctx_output, batch_first=True)
-        D = e_ctx.contiguous()  # B x m x l
-        b, m, _ = list(D.size())
-
-        # copy sentinel vector at the end
-        d_sentinel_exp = self.d_sentinel.unsqueeze(0).expand(b, self.hidden_dim).unsqueeze(1).contiguous()  # B x 1 x l
-        indices = torch.from_numpy(d_lens)
-        if use_cuda:
-            indices = indices.cuda()
-        indices = indices.unsqueeze(1).expand(b, self.hidden_dim).unsqueeze(1)
-
-        sentinel_zero = torch.zeros(b, 1, self.hidden_dim)
-        if use_cuda:
-            sentinel_zero = sentinel_zero.cuda()
-        D = torch.cat([D, sentinel_zero], 1)  # B x m + 1 x l
-        D = D.scatter_(1, indices, d_sentinel_exp)
-
-        # query processing
-        q_lens_idx = torch.from_numpy(np.ascontiguousarray(np.flip(np.argsort(q_lens), axis=0)))
-        if use_cuda:
-            q_lens_idx = q_lens_idx.cuda()
-        q_lens_idx_rev = torch.from_numpy(np.ascontiguousarray(np.argsort(q_lens_idx)))
-        if use_cuda:
-            q_lens_idx_rev = q_lens_idx_rev.cuda()
-        q_lens_ = q_lens[q_lens_idx]
-
-        q_seq_ = torch.index_select(q_seq, 0, q_lens_idx)
-        q_seq_embd = self.embedding(q_seq_)
-        #q_seq_embd = self.dropout_embd(q_seq_embd)
-
-        q_packed = pack_padded_sequence(q_seq_embd, q_lens_, batch_first=True)
-        q_output, _ = self.encoder(q_packed)
-        e_q_, _ = pad_packed_sequence(q_output, batch_first=True)
-        e_q_ = e_q_.contiguous()
-
-        e_q = torch.index_select(e_q_, 0, q_lens_idx_rev) #B x n x l
-
-        #copy sentinel vector at the end
-        q_sentinel_exp = self.q_sentinel.unsqueeze(0).expand(b, self.hidden_dim).unsqueeze(1).contiguous() #B x 1 x l
-        indices = torch.from_numpy(q_lens)
-        if use_cuda:
-            indices = indices.cuda()
-        indices = indices.unsqueeze(1).expand(b, self.hidden_dim).unsqueeze(1)
-        sentinel_zero = torch.zeros(b, 1, self.hidden_dim)
-        if use_cuda:
-            sentinel_zero = sentinel_zero.cuda()
-        e_q = torch.cat([e_q, sentinel_zero], 1) #B x n + 1 x l
-        e_q = e_q.scatter_(1, indices, q_sentinel_exp)
+    def forward(self, q_seq, q_mask, d_seq, d_mask, span=None):
+        Q = self.encoder(q_seq, q_mask) # b x n + 1 x l
+        D = self.encoder(d_seq, d_mask)  # B x m + 1 x l
 
         #project q
-        Q = F.tanh(self.q_proj(e_q.view(-1, self.hidden_dim))).view(e_q.size()) #B x n + 1 x l
+        Q = F.tanh(self.q_proj(Q.view(-1, self.hidden_dim))).view(Q.size()) #B x n + 1 x l
 
         #co attention
         D_t = torch.transpose(D, 1, 2) #B x l x m + 1
@@ -210,70 +261,13 @@ class CoattentionModel(nn.Module):
 
         C_D_t = torch.transpose(C_D, 1, 2)  # B x m + 1 x 2l
 
+        #fusion BiLSTM
         bilstm_in = torch.cat((C_D_t, D), 2) # B x m + 1 x 3l
-
         #?? should it be d_lens + 1 and get U[:-1]
-        bilstm_in_packed = pack_padded_sequence(bilstm_in, d_lens, batch_first=True)
-        bilstm_in_output, _ = self.fusion_bilstm(bilstm_in_packed)
-        U, _ = pad_packed_sequence(bilstm_in_output, batch_first=True)
-        U = U.contiguous() #B x m x 2l
+        U = self.fusion_bilstm(bilstm_in, d_mask) #B x m x 2l
 
-        #??how to initialize s_i_1, e_i_1
-        s_i_1 = Variable(torch.zeros(b)).long()
-        e_i_1 = Variable(torch.zeros(b).fill_(m-1)).long()
-        if use_cuda:
-            s_i_1 = s_i_1.cuda()
-            e_i_1 = e_i_1.cuda()
-
-        dec_state_i = None
-        step_losses = []
-        curr_mask_s = None
-        curr_mask_e = None
-
-        results_mask_s = []
-        results_s = []
-
-        results_mask_e = []
-        results_e = []
-
-        D_mask = get_mask_from_seq_len(d_lens)
-        mask_mult = (1.0 - D_mask) * (-1e30)
-
-        for _ in range(self.max_dec_steps):
-            indices = torch.arange(0, b, out=torch.LongTensor(b))
-            u_s_i_1 = U[indices, s_i_1, :] #b x 2l
-            u_e_i_1 = U[indices, e_i_1, :] #b x 2l
-            u_cat = torch.cat((u_s_i_1, u_e_i_1), 1) #b x 4l
-            lstm_out, dec_state_i = self.decoder(u_cat.unsqueeze(1), dec_state_i)
-            h_i, c_i = dec_state_i
-
-            if span is not None:
-                s_i_1, curr_mask_s, step_loss_s = self.maxout_start(h_i, U, d_lens, curr_mask_s, s_i_1, u_cat, D_mask, mask_mult, span[:, 0])
-                e_i_1, curr_mask_e, step_loss_e = self.maxout_end(h_i, U, d_lens, curr_mask_e, e_i_1, u_cat, D_mask, mask_mult, span[:, 1])
-                step_loss = step_loss_s + step_loss_e
-                step_losses.append(step_loss)
-            else:
-                s_i_1, curr_mask_s = self.maxout_start(h_i, U, d_lens, curr_mask_s, s_i_1, u_cat, D_mask, mask_mult)
-                e_i_1, curr_mask_e = self.maxout_end(h_i, U, d_lens, curr_mask_e, e_i_1, u_cat, D_mask, mask_mult)
-
-            results_mask_s.append(curr_mask_s)
-            results_s.append(s_i_1)
-            results_mask_e.append(curr_mask_e)
-            results_e.append(e_i_1)
-
-        result_pos_s = torch.sum(torch.stack(results_mask_s, 1), 1).long()
-        result_pos_s = result_pos_s - 1
-        idx_s = torch.gather(torch.stack(results_s, 1), 1, result_pos_s.unsqueeze(1)).squeeze()
-
-        result_pos_e = torch.sum(torch.stack(results_mask_e, 1), 1).long()
-        result_pos_e = result_pos_e - 1
-        idx_e = torch.gather(torch.stack(results_e, 1), 1, result_pos_e.unsqueeze(1)).squeeze()
-
+        loss, idx_s, idx_e = self.decoder(U, d_mask, span)
         if span is not None:
-            sum_losses = torch.sum(torch.stack(step_losses, 1), 1)
-            batch_avg_loss = sum_losses / self.max_dec_steps
-            loss = torch.mean(batch_avg_loss)
             return loss, idx_s, idx_e
         else:
             return idx_s, idx_e
-
