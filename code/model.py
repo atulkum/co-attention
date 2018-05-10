@@ -105,9 +105,7 @@ class DynamicDecoder(nn.Module):
         results_mask_e, results_e = [], []
         step_losses = []
 
-        # decoder
         mask_mult = (1.0 - d_mask.float()) * (-1e30)
-
         indices = torch.arange(0, b, out=torch.LongTensor(b))
 
         # ??how to initialize s_i_1, e_i_1
@@ -121,23 +119,24 @@ class DynamicDecoder(nn.Module):
             indices = indices.cuda()
 
         dec_state_i = None
-
+        s_target = None
+        e_target = None
+        if span is not None:
+            s_target = span[:, 0]
+            e_target = span[:, 1]
+        u_s_i_1 = U[indices, s_i_1, :]  # b x 2l
         for _ in range(self.max_dec_steps):
-            u_s_i_1 = U[indices, s_i_1, :]  # b x 2l
             u_e_i_1 = U[indices, e_i_1, :]  # b x 2l
             u_cat = torch.cat((u_s_i_1, u_e_i_1), 1)  # b x 4l
 
             lstm_out, dec_state_i = self.decoder(u_cat.unsqueeze(1), dec_state_i)
             h_i, c_i = dec_state_i
-            s_target = None
-            e_target = None
-
-            if span is not None:
-                s_target = span[:, 0]
-                e_target = span[:, 1]
 
             s_i_1, curr_mask_s, step_loss_s = self.maxout_start(h_i, U, curr_mask_s, s_i_1,
                                                                 u_cat, mask_mult, s_target)
+            u_s_i_1 = U[indices, s_i_1, :]  # b x 2l
+            u_cat = torch.cat((u_s_i_1, u_e_i_1), 1)  # b x 4l
+
             e_i_1, curr_mask_e, step_loss_e = self.maxout_end(h_i, U, curr_mask_e, e_i_1,
                                                               u_cat, mask_mult, e_target)
 

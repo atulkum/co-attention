@@ -22,7 +22,7 @@ config.lr = 0.001
 config.dropout_ratio = 0.15
 
 config.max_grad_norm = 5.0
-config.batch_size = 128
+config.batch_size = 100
 config.num_epochs = 50
 
 config.print_every = 100
