@@ -72,6 +72,7 @@ class FusionBiLSTM(nn.Module):
         self.fusion_bilstm = nn.LSTM(3 * hidden_dim, hidden_dim, 1, batch_first=True,
                                      bidirectional=True, dropout=dropout_ratio)
         init_lstm_forget_bias(self.fusion_bilstm)
+        self.dropout = nn.Dropout(p=dropout_ratio)
 
     def forward(self, seq, mask):
         lens = torch.sum(mask, 1)
@@ -83,7 +84,7 @@ class FusionBiLSTM(nn.Module):
         e, _ = pad_packed_sequence(output, batch_first=True)
         e = e.contiguous()
         e = torch.index_select(e, 0, lens_argsort_argsort)  # B x m x 2l
-
+        e = self.dropout(e)
         return e
 
 class DynamicDecoder(nn.Module):
@@ -174,13 +175,13 @@ class MaxOutHighway(nn.Module):
         self.maxout_pool_size = maxout_pool_size
 
         self.r = nn.Linear(5 * hidden_dim, hidden_dim, bias=False)
-        self.dropout_r = nn.Dropout(p=dropout_ratio)
+        #self.dropout_r = nn.Dropout(p=dropout_ratio)
 
         self.m_t_1_mxp = nn.Linear(3 * hidden_dim, hidden_dim*maxout_pool_size)
-        self.dropout_m_t_1 = nn.Dropout(p=dropout_ratio)
+        #self.dropout_m_t_1 = nn.Dropout(p=dropout_ratio)
 
         self.m_t_2_mxp = nn.Linear(hidden_dim, hidden_dim*maxout_pool_size)
-        self.dropout_m_t_2 = nn.Dropout(p=dropout_ratio)
+        #self.dropout_m_t_2 = nn.Dropout(p=dropout_ratio)
 
         self.m_t_12_mxp = nn.Linear(2 * hidden_dim, maxout_pool_size)
 
@@ -190,18 +191,18 @@ class MaxOutHighway(nn.Module):
         b, m, _ = list(U.size())
 
         r = F.tanh(self.r(torch.cat((h_i.view(-1, self.hidden_dim), u_cat), 1)))  # b x 5l => b x l
-        r = self.dropout_r(r)
+        #r = self.dropout_r(r)
 
         r_expanded = r.unsqueeze(1).expand(b, m, self.hidden_dim).contiguous()  # b x m x l
 
         m_t_1_in = torch.cat((U, r_expanded), 2).view(-1, 3*self.hidden_dim)  # b*m x 3l
 
         m_t_1 = self.m_t_1_mxp(m_t_1_in)  # b*m x p*l
-        m_t_1 = self.dropout_m_t_1(m_t_1)
+        #m_t_1 = self.dropout_m_t_1(m_t_1)
         m_t_1, _ = m_t_1.view(-1, self.hidden_dim, self.maxout_pool_size).max(2) # b*m x l
 
         m_t_2 = self.m_t_2_mxp(m_t_1)  # b*m x l*p
-        m_t_2 = self.dropout_m_t_2(m_t_2)
+        #m_t_2 = self.dropout_m_t_2(m_t_2)
         m_t_2, _ = m_t_2.view(-1, self.hidden_dim, self.maxout_pool_size).max(2)  # b*m x l
 
         alpha_in = torch.cat((m_t_1, m_t_2), 1)  # b*m x 2l
@@ -239,6 +240,7 @@ class CoattentionModel(nn.Module):
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.fusion_bilstm = FusionBiLSTM(hidden_dim, dropout_ratio)
         self.decoder = DynamicDecoder(hidden_dim, maxout_pool_size, max_dec_steps, dropout_ratio)
+        self.dropout = nn.Dropout(p=dropout_ratio)
 
     def forward(self, q_seq, q_mask, d_seq, d_mask, span=None):
         Q = self.encoder(q_seq, q_mask) # b x n + 1 x l
@@ -263,6 +265,7 @@ class CoattentionModel(nn.Module):
 
         #fusion BiLSTM
         bilstm_in = torch.cat((C_D_t, D), 2) # B x m + 1 x 3l
+        bilstm_in = self.dropout(bilstm_in)
         #?? should it be d_lens + 1 and get U[:-1]
         U = self.fusion_bilstm(bilstm_in, d_mask) #B x m x 2l
 

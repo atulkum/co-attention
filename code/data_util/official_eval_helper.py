@@ -22,11 +22,11 @@ from __future__ import division
 import os
 
 import numpy as np
-from data_batcher import padded, Batch
+from data_util.data_batcher import padded, Batch
 from nltk.tokenize.moses import MosesDetokenizer
 from six.moves import xrange
 from tqdm import tqdm
-from vocab import UNK_ID, PAD_ID
+from data_util.vocab import UNK_ID, PAD_ID
 
 from preprocessing.squad_preprocess import data_from_json, tokenize
 

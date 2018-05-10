@@ -122,6 +122,15 @@ class Processor(object):
         optimizer.zero_grad()
         q_seq, q_lens, d_seq, d_lens, span = self.get_data(batch)
         loss, _, _ = model(q_seq, q_lens, d_seq, d_lens, span)
+	
+	l2_reg = None
+	for W in params:
+    	    if l2_reg is None:
+        	l2_reg = W.norm(2)
+    	    else:
+        	l2_reg = l2_reg + W.norm(2)
+	loss = loss + config.reg_lambda * l2_reg
+
         loss.backward()
 
         param_norm = self.get_param_norm(params)
@@ -162,7 +171,7 @@ class Processor(object):
 
         model = self.get_model(model_file_path)
         params = filter(lambda p: p.requires_grad, model.parameters())
-        optimizer = Adam(params, lr=config.lr)
+        optimizer = Adam(params, lr=config.lr, amsgrad=True)
 
         num_params = sum(p.numel() for p in params)
         logging.info("Number of params: %d" % num_params)
@@ -322,7 +331,7 @@ def write_summary(value, tag, summary_writer, global_step):
     summary_writer.add_summary(summary, global_step)
 
 if __name__ == "__main__":
-    mode = 'train' #sys.argv[1]
+    mode = sys.argv[1]
     processor = Processor()
     if mode == "train":
         model_file_path = None

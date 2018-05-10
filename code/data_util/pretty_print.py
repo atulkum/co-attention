@@ -15,7 +15,7 @@
 """This file contains functions to pretty-print a SQuAD example"""
 
 from colorama import Fore, Back, Style
-from vocab import _PAD
+from data_util.vocab import _PAD
 
 # See here for more colorama formatting options:
 # https://pypi.python.org/pypi/colorama

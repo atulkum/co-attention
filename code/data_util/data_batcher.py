@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 from six.moves import xrange
-from vocab import PAD_ID, UNK_ID
+from data_util.vocab import PAD_ID, UNK_ID
 
 
 class Batch(object):
