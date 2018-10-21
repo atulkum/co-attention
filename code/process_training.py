@@ -170,7 +170,7 @@ class Processor(object):
             json.dump(vars(config), fout)
 
         model = self.get_model(model_file_path)
-        params = filter(lambda p: p.requires_grad, model.parameters())
+        params = list(filter(lambda p: p.requires_grad, model.parameters()))
         optimizer = Adam(params, lr=config.lr, amsgrad=True)
 
         num_params = sum(p.numel() for p in params)
